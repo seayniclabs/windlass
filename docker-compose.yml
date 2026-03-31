@@ -1,0 +1,28 @@
+services:
+  windlass:
+    image: ghcr.io/seayniclabs/windlass:latest
+    container_name: windlass
+    restart: unless-stopped
+    ports:
+      - "8116:8116"
+    volumes:
+      # Mount your schedule.yaml and state directory
+      - /opt/windlass:/opt/windlass
+      # Mount Docker socket so Windlass can manage host containers
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Mount your compose directories so Windlass can start/stop stacks
+      # Add one entry per service in your schedule.yaml
+      # - /opt/containers:/opt/containers
+    environment:
+      - TZ=America/Chicago
+      - WINDLASS_CONFIG=/opt/windlass
+      - WINDLASS_INTERVAL=300   # Scheduler interval in seconds (default: 300)
+    networks:
+      - windlass-net
+
+networks:
+  windlass-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.20.0.0/24

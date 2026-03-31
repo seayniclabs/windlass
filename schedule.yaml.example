@@ -1,0 +1,39 @@
+services:
+  # Always-on: restarted automatically if stopped
+  nginx-proxy-manager:
+    compose_path: /opt/containers/npm
+    containers: [npm]
+    type: always
+    memory_mb: 150
+    priority: 1
+    description: Reverse proxy for all services
+
+  # Scheduled: starts/stops on a cron window
+  postiz:
+    compose_path: /opt/containers/postiz
+    containers: [postiz-app, postiz-worker, postiz-postgres, postiz-redis]
+    type: schedule
+    memory_mb: 2300
+    priority: 4
+    description: Social media scheduler
+    cron_start: "0 23 * * *"    # Start at 11 PM
+    cron_stop: "0 4 * * *"      # Stop at 4 AM
+
+  # On-demand: started manually, auto-stopped after idle timeout
+  grafana:
+    compose_path: /opt/containers/grafana
+    containers: [grafana]
+    type: on-demand
+    memory_mb: 250
+    priority: 3
+    description: Dashboards and metrics
+    idle_shutdown_minutes: 30
+
+  # Manual: tracked but never auto-managed
+  dev-env:
+    compose_path: /opt/containers/dev
+    containers: [dev-env]
+    type: manual
+    memory_mb: 512
+    priority: 5
+    description: Development environment (start/stop manually)
