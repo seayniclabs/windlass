@@ -59,6 +59,51 @@ services:
 | `POST` | `/exec` | `{command}` — run an allowlisted command |
 | `GET` | `/health` | `{"ok": true}` |
 
+## Deployment Notes
+
+Three things that reliably cause problems on first deploy:
+
+### 1. schedule.yaml — compose_path and container names
+
+`compose_path` must point to the **directory containing `docker-compose.yml`**, not the file itself:
+
+```yaml
+compose_path: /opt/containers/postiz   # correct
+compose_path: /opt/containers/postiz/docker-compose.yml  # wrong
+```
+
+The `containers` list takes **actual Docker container names** (as shown in `docker ps`), not Compose service names. Auto-generated names follow the pattern `{project}-{service}-1`. Pin them in your compose file with `container_name:` to make them predictable, then reference those names in `schedule.yaml`.
+
+```bash
+# Check exact container names on your host before editing schedule.yaml
+docker ps --format '{{.Names}}'
+```
+
+### 2. Docker socket must be :rw
+
+Windlass needs read-write access to the Docker socket. A read-only mount (`:ro`) allows state inspection but silently prevents start/stop operations — `always` services won't restart, scheduled windows will fail, and manual controls in StdOut will return errors.
+
+```yaml
+volumes:
+  - /var/run/docker.sock:/var/run/docker.sock      # correct (rw is default)
+  # - /var/run/docker.sock:/var/run/docker.sock:ro  # breaks container management
+```
+
+### 3. Cron times are UTC — TZ env var does not affect scheduling
+
+All `cron_start` and `cron_stop` expressions are evaluated in UTC. Setting `TZ=America/Chicago` changes log timestamps only — it does not shift when cron windows fire.
+
+If you want a service to start at 11 PM Central (CDT, UTC−5), write:
+
+```yaml
+cron_start: "0 4 * * *"   # 4 AM UTC = 11 PM CDT
+cron_stop:  "0 9 * * *"   # 9 AM UTC = 4 AM CDT
+```
+
+CST (winter) is UTC−6; CDT (summer) is UTC−5. Convert accordingly.
+
+---
+
 ## Without Docker (bare metal)
 
 ```bash
