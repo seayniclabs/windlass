@@ -25,6 +25,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -53,6 +55,14 @@ STATE_FILE = CONFIG_DIR / "state.json"
 LOG_FILE = CONFIG_DIR / "windlass.log"
 SCHEDULE_INTERVAL_SEC = int(os.environ.get("WINDLASS_INTERVAL", "300"))  # 5 min
 MAX_EVENTS = 100
+MEMORY_SHED_FREE_MB_THRESHOLD = int(os.environ.get("WINDLASS_MEMORY_SHED_FREE_MB", "1024"))
+N8N_WORKFLOWS_FILE = Path(os.environ.get("WINDLASS_N8N_WORKFLOWS", str(CONFIG_DIR / "n8n-workflows.json")))
+# Optional live n8n REST (e.g. WINDLASS_N8N_BASE_URL=http://localhost:5678/api/v1)
+WINDLASS_N8N_BASE_URL = os.environ.get("WINDLASS_N8N_BASE_URL", "").strip().rstrip("/")
+WINDLASS_N8N_API_KEY = (
+    os.environ.get("WINDLASS_N8N_API_KEY", "").strip()
+    or os.environ.get("N8N_API_KEY", "").strip()
+)
 
 EXEC_ALLOWED_PREFIXES = [
     "docker ", "docker-compose ", "curl ", "dig ", "nslookup ",
@@ -197,6 +207,122 @@ def get_schedule_windows(services: dict) -> list[dict]:
     return windows
 
 
+def _n8n_windows_from_file(limit: int = 7) -> list[dict]:
+    if not HAS_CRONITER or not N8N_WORKFLOWS_FILE.exists():
+        return []
+    try:
+        raw = json.loads(N8N_WORKFLOWS_FILE.read_text())
+    except Exception:
+        return []
+
+    workflows = raw.get("workflows", []) if isinstance(raw, dict) else []
+    now = datetime.now(timezone.utc)
+    windows = []
+    for wf in workflows:
+        cron = wf.get("cron")
+        name = wf.get("name")
+        if not cron or not name:
+            continue
+        try:
+            it = croniter(cron, now)
+            runs = []
+            for _ in range(limit):
+                run_at = it.get_next(datetime)
+                runs.append({
+                    "start": run_at.isoformat(),
+                    "end": (run_at + timedelta(minutes=5)).isoformat(),
+                })
+            windows.append({"name": name, "cron": cron, "windows": runs})
+        except Exception:
+            continue
+    return windows
+
+
+def _cron_expression_from_node(node: dict) -> str | None:
+    params = node.get("parameters") or {}
+    if params.get("cronExpression"):
+        return str(params["cronExpression"]).strip()
+    rule = params.get("rule") or {}
+    if isinstance(rule, dict) and rule.get("expression"):
+        return str(rule["expression"]).strip()
+    trigger_times = params.get("triggerTimes") or {}
+    items = trigger_times.get("item") if isinstance(trigger_times, dict) else None
+    if isinstance(items, list) and items:
+        ce = items[0].get("cronExpression") if isinstance(items[0], dict) else None
+        if ce:
+            return str(ce).strip()
+    return None
+
+
+def _n8n_windows_from_api(limit: int = 7) -> list[dict]:
+    """Fetch active workflows from n8n REST and derive next run windows from Cron nodes."""
+    if not HAS_CRONITER or not WINDLASS_N8N_BASE_URL or not WINDLASS_N8N_API_KEY:
+        return []
+    url = f"{WINDLASS_N8N_BASE_URL}/workflows"
+    req = urllib.request.Request(
+        url,
+        headers={"X-N8N-API-KEY": WINDLASS_N8N_API_KEY},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            payload = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        log.warning("n8n workflows HTTP %s: %s", e.code, e.reason)
+        return []
+    except Exception as e:
+        log.warning("n8n workflows fetch failed: %s", e)
+        return []
+
+    workflows = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(workflows, list):
+        return []
+
+    now = datetime.now(timezone.utc)
+    out: list[dict] = []
+    for wf in workflows:
+        if not wf or not wf.get("active"):
+            continue
+        name = wf.get("name") or wf.get("id") or "workflow"
+        nodes = wf.get("nodes") or []
+        cron_expr = None
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            ntype = str(node.get("type") or "")
+            if ntype == "n8n-nodes-base.cron" or ".cron" in ntype:
+                cron_expr = _cron_expression_from_node(node)
+                if cron_expr:
+                    break
+        if not cron_expr:
+            continue
+        try:
+            it = croniter(cron_expr, now)
+            runs = []
+            for _ in range(limit):
+                run_at = it.get_next(datetime)
+                runs.append({
+                    "start": run_at.isoformat(),
+                    "end": (run_at + timedelta(minutes=5)).isoformat(),
+                })
+            out.append({"name": name, "cron": cron_expr, "windows": runs})
+        except Exception:
+            continue
+    return out
+
+
+def get_n8n_workflow_windows(limit: int = 7) -> list[dict]:
+    """Merge file-based snapshot with live n8n API (when configured)."""
+    merged: dict = {}
+    for wf in _n8n_windows_from_file(limit):
+        key = (wf.get("name") or "", wf.get("cron") or "")
+        merged[key] = wf
+    for wf in _n8n_windows_from_api(limit):
+        key = (wf.get("name") or "", wf.get("cron") or "")
+        merged[key] = wf
+    return list(merged.values())
+
+
 # ---------------------------------------------------------------------------
 # Docker operations
 # ---------------------------------------------------------------------------
@@ -333,6 +459,7 @@ def build_status(schedule: dict, state: dict) -> dict:
             "priority": cfg.get("priority", 5),
             "description": cfg.get("description", ""),
             "containers": containers,
+            "last_memory_shed_reason": svc_state.get("last_memory_shed_reason"),
         })
 
     # Docker-level memory
@@ -357,11 +484,14 @@ def build_status(schedule: dict, state: dict) -> dict:
             "docker_memory_limit_mb": docker_limit_mb,
             "system_memory_total_mb": sys_total,
             "system_memory_free_mb": sys_free,
+            "scheduler_interval_sec": SCHEDULE_INTERVAL_SEC,
         },
         "services": service_states,
         "upcoming_events": get_upcoming_events(schedule),
         "recent_events": list(reversed(state.get("events", [])[-20:])),
         "schedule_windows": get_schedule_windows(schedule),
+        "n8n_workflow_windows": get_n8n_workflow_windows(),
+        "service_analytics": state.get("analytics", {}),
     }
 
 
@@ -377,6 +507,7 @@ def run_scheduler(schedule: dict | None = None) -> None:
         state = load_state()
         now = datetime.now(timezone.utc)
         changed = False
+        analytics = state.setdefault("analytics", {})
 
         for name, cfg in schedule.items():
             svc_type = cfg.get("type", "manual")
@@ -388,6 +519,11 @@ def run_scheduler(schedule: dict | None = None) -> None:
 
             current_state, _ = get_container_states(containers)
             svc_state = state.setdefault("services", {}).setdefault(name, {})
+            svc_analytics = analytics.setdefault(name, {"hourly": {}, "idle_minutes_total": 0, "samples": 0})
+            hour_key = now.strftime("%H")
+            bucket = svc_analytics["hourly"].setdefault(hour_key, {"running": 0, "idle": 0, "total": 0})
+            bucket["total"] += 1
+            svc_analytics["samples"] += 1
 
             if svc_type == "always":
                 if current_state != "running":
@@ -422,15 +558,21 @@ def run_scheduler(schedule: dict | None = None) -> None:
                 idle_minutes = cfg.get("idle_shutdown_minutes")
                 if not idle_minutes or current_state != "running":
                     svc_state["idle_since"] = None
+                    if current_state == "running":
+                        bucket["running"] += 1
                     continue
 
                 if not svc_state.get("idle_since"):
                     svc_state["idle_since"] = now.isoformat()
+                    bucket["running"] += 1
                 else:
                     idle_since = datetime.fromisoformat(svc_state["idle_since"])
                     if idle_since.tzinfo is None:
                         idle_since = idle_since.replace(tzinfo=timezone.utc)
                     elapsed = (now - idle_since).total_seconds() / 60
+                    bucket["running"] += 1
+                    bucket["idle"] += 1
+                    svc_analytics["idle_minutes_total"] += SCHEDULE_INTERVAL_SEC / 60
                     if elapsed >= idle_minutes:
                         log.info("on-demand idle shutdown: stopping %s (idle %.1f min)", name, elapsed)
                         if docker_compose_down(compose_path, name):
@@ -438,10 +580,44 @@ def run_scheduler(schedule: dict | None = None) -> None:
                             svc_state["idle_since"] = None
                             log_event(state, name, "service_stopped", f"idle timeout ({idle_minutes}m)")
                             changed = True
+            elif current_state == "running":
+                bucket["running"] += 1
 
-        if changed or True:  # always update timestamp
+        # Memory pressure auto-shedding for on-demand services.
+        _, free_mb = get_system_memory()
+        if free_mb and free_mb < MEMORY_SHED_FREE_MB_THRESHOLD:
+            candidates = []
+            for name, cfg in schedule.items():
+                if cfg.get("type") != "on-demand":
+                    continue
+                current_state, mem_mb = get_container_states(cfg.get("containers", []))
+                if current_state == "running" and cfg.get("compose_path"):
+                    candidates.append({
+                        "name": name,
+                        "compose_path": cfg.get("compose_path"),
+                        "priority": int(cfg.get("priority", 5)),
+                        "memory_mb": mem_mb,
+                    })
+            candidates.sort(key=lambda c: (c["priority"], c["memory_mb"]), reverse=True)
+            recovered_mb = 0.0
+            for cand in candidates:
+                if free_mb + recovered_mb >= MEMORY_SHED_FREE_MB_THRESHOLD:
+                    break
+                if docker_compose_down(cand["compose_path"], cand["name"]):
+                    svc_state = state.setdefault("services", {}).setdefault(cand["name"], {})
+                    svc_state["last_stopped"] = now.isoformat()
+                    recovered_mb += cand["memory_mb"]
+                    reason = (
+                        f"memory pressure (free={free_mb}MB < {MEMORY_SHED_FREE_MB_THRESHOLD}MB); "
+                        f"auto-shed priority={cand['priority']} recovered~{round(cand['memory_mb'], 1)}MB"
+                    )
+                    svc_state["last_memory_shed_reason"] = reason
+                    log_event(state, cand["name"], "memory_shed", reason)
+                    changed = True
+
+        if changed:
             log_event(state, None, "sync_completed", f"Evaluated {len(schedule)} services")
-            save_state(state)
+        save_state(state)
 
     log.info("Scheduler run complete (%d services)", len(schedule))
 
@@ -480,6 +656,10 @@ def control_service(service_name: str, action: str, schedule: dict) -> dict:
 
 def execute_command(command: str) -> dict:
     """Run a shell command; enforce allowlist. Returns {exitCode, stdout, stderr}."""
+    if "\n" in command or "\r" in command or "\x00" in command:
+        return {"exitCode": 1, "stdout": "", "stderr": "Command blocked: NUL/newlines are not allowed"}
+    if "&&" in command or "||" in command:
+        return {"exitCode": 1, "stdout": "", "stderr": "Command blocked: shell chaining (&& or ||) is not allowed"}
     cmd_lower = command.lower().strip()
 
     for blocked in EXEC_BLOCKED_PATTERNS:
