@@ -660,6 +660,9 @@ def execute_command(command: str) -> dict:
         return {"exitCode": 1, "stdout": "", "stderr": "Command blocked: NUL/newlines are not allowed"}
     if "&&" in command or "||" in command:
         return {"exitCode": 1, "stdout": "", "stderr": "Command blocked: shell chaining (&& or ||) is not allowed"}
+    for ch in (";", "|", "$", "`"):
+        if ch in command:
+            return {"exitCode": 1, "stdout": "", "stderr": "Command blocked: shell metacharacters are not allowed"}
     cmd_lower = command.lower().strip()
 
     for blocked in EXEC_BLOCKED_PATTERNS:
@@ -725,7 +728,7 @@ class WindlassHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
@@ -781,6 +784,35 @@ class WindlassHandler(BaseHTTPRequestHandler):
 
         else:
             self.send_json({"error": "Not found"}, 404)
+
+    def do_PUT(self):
+        if self.path != "/config/schedule":
+            self.send_json({"error": "Not found"}, 404)
+            return
+
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length).decode("utf-8", errors="replace")
+        if not body.strip():
+            self.send_json({"error": "YAML body required"}, 400)
+            return
+
+        try:
+            parsed = yaml.safe_load(body)
+            if not isinstance(parsed, dict) or "services" not in parsed:
+                self.send_json({"error": "YAML must contain a services: block"}, 400)
+                return
+        except Exception as e:
+            self.send_json({"error": f"Invalid YAML: {e}"}, 400)
+            return
+
+        try:
+            SCHEDULE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            SCHEDULE_FILE.write_text(body, encoding="utf-8")
+            refresh_status_cache()
+            self.send_json({"ok": True, "services": len(load_schedule())})
+        except Exception as e:
+            log.error("Failed to write schedule: %s", e)
+            self.send_json({"error": str(e)}, 500)
 
 
 def run_server(port: int) -> None:
