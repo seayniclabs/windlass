@@ -50,6 +50,29 @@ services:
     idle_shutdown_minutes: 30
 ```
 
+**Optional n8n workflow awareness file (`n8n-workflows.json`):**
+```json
+{
+  "workflows": [
+    { "name": "Nightly backup", "cron": "0 3 * * *" }
+  ]
+}
+```
+When present, Windlass exposes these windows in `/status.json` as `n8n_workflow_windows` so StdOut can render them in timeline view.
+
+**Optional live n8n REST (merged with the file above):**
+| Env | Description |
+|-----|-------------|
+| `WINDLASS_N8N_BASE_URL` | API root including `/api/v1`, e.g. `http://n8n:5678/api/v1` |
+| `WINDLASS_N8N_API_KEY` or `N8N_API_KEY` | n8n API key (`X-N8N-API-KEY` header) |
+
+**Phase 4 — memory pressure auto-shed (on-demand only):**
+| Env | Default | Description |
+|-----|---------|-------------|
+| `WINDLASS_MEMORY_SHED_FREE_MB` | `1024` | When host free RAM drops below this, lowest-priority running `on-demand` stacks are stopped until free memory recovers. Each shed is logged with a reason in `recent_events` and on the service row as `last_memory_shed_reason` in `/status.json`. |
+
+`status.json` also includes `summary.scheduler_interval_sec` (from `WINDLASS_INTERVAL`) so StdOut can extrapolate idle hours per day from collected samples.
+
 ## API
 
 | Method | Path | Description |
@@ -127,6 +150,24 @@ windlass --serve --port 8116
 |----------|---------|-------------|
 | `WINDLASS_CONFIG` | `/opt/windlass` | Directory for schedule.yaml and state.json |
 | `WINDLASS_INTERVAL` | `300` | Scheduler interval in seconds (serve mode) |
+| `WINDLASS_MEMORY_SHED_FREE_MB` | `1024` | Free RAM threshold for on-demand auto-shedding |
+| `WINDLASS_N8N_WORKFLOWS` | `/opt/windlass/n8n-workflows.json` | Optional workflow cron file for n8n windows |
+| `STDOUT_URL` | `http://localhost:8112` | StdOut base URL the watchdog health-checks |
+| `STDOUT_CONTAINER` | `stdout` | StdOut container name the watchdog restarts |
+| `WINDLASS_WATCHDOG` | `true` | Enable the StdOut watchdog (Windlass watches StdOut) |
+| `WINDLASS_WATCHDOG_INTERVAL` | `30` | Watchdog health-poll interval (seconds) |
+| `WINDLASS_WATCHDOG_FAILS` | `3` | Consecutive failures before restarting StdOut |
+| `WINDLASS_WATCHDOG_MAX_RESTARTS` | `5` | Circuit breaker: max restarts per window before escalating |
+| `WINDLASS_WATCHDOG_WINDOW` | `3600` | Circuit-breaker window (seconds) |
+
+## StdOut watchdog
+
+StdOut is the eyes+brain of the system; it cannot watch itself. Windlass — running in a separate
+container — polls `STDOUT_URL/healthz` every `WINDLASS_WATCHDOG_INTERVAL` seconds and, after
+`WINDLASS_WATCHDOG_FAILS` consecutive failures, restarts the StdOut container via `docker restart`.
+A circuit breaker caps restarts at `WINDLASS_WATCHDOG_MAX_RESTARTS` per `WINDLASS_WATCHDOG_WINDOW`;
+once exhausted it stops restarting and logs an escalation (a crash-loop needs investigation, not
+more restarts). This is the reliability backbone of the autonomic stack.
 
 ## Architecture
 

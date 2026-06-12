@@ -55,6 +55,18 @@ STATE_FILE = CONFIG_DIR / "state.json"
 LOG_FILE = CONFIG_DIR / "windlass.log"
 SCHEDULE_INTERVAL_SEC = int(os.environ.get("WINDLASS_INTERVAL", "300"))  # 5 min
 MAX_EVENTS = 100
+
+# --- StdOut watchdog (Windlass watches StdOut because StdOut can't watch itself) ---
+# StdOut is the eyes/brain; Windlass is the external watchdog. If StdOut's health endpoint
+# goes dark for N consecutive checks, Windlass restarts its container. A circuit breaker caps
+# restarts in a window so a crash-loop doesn't get hammered forever (escalates via log instead).
+STDOUT_URL = os.environ.get("STDOUT_URL", "http://localhost:8112").strip().rstrip("/")
+STDOUT_CONTAINER = os.environ.get("STDOUT_CONTAINER", "stdout").strip()
+WATCHDOG_ENABLED = os.environ.get("WINDLASS_WATCHDOG", "true").strip().lower() in ("1", "true", "yes")
+WATCHDOG_INTERVAL_SEC = int(os.environ.get("WINDLASS_WATCHDOG_INTERVAL", "30"))
+WATCHDOG_FAIL_THRESHOLD = int(os.environ.get("WINDLASS_WATCHDOG_FAILS", "3"))  # consecutive fails before restart
+WATCHDOG_MAX_RESTARTS = int(os.environ.get("WINDLASS_WATCHDOG_MAX_RESTARTS", "5"))  # per window
+WATCHDOG_RESTART_WINDOW_SEC = int(os.environ.get("WINDLASS_WATCHDOG_WINDOW", "3600"))  # 1h
 MEMORY_SHED_FREE_MB_THRESHOLD = int(os.environ.get("WINDLASS_MEMORY_SHED_FREE_MB", "1024"))
 N8N_WORKFLOWS_FILE = Path(os.environ.get("WINDLASS_N8N_WORKFLOWS", str(CONFIG_DIR / "n8n-workflows.json")))
 # Optional live n8n REST (e.g. WINDLASS_N8N_BASE_URL=http://localhost:5678/api/v1)
@@ -67,6 +79,7 @@ WINDLASS_N8N_API_KEY = (
 EXEC_ALLOWED_PREFIXES = [
     "docker ", "docker-compose ", "curl ", "dig ", "nslookup ",
     "ping ", "netstat ", "ss ", "openssl ", "cat /",
+    "git -C ", "git log", "git status", "git rev-parse", "git describe",
 ]
 EXEC_BLOCKED_PATTERNS = [
     "rm -rf /", "mkfs", "dd if=", ":(){:|:&};:", "chmod -R 777 /",
@@ -815,6 +828,102 @@ class WindlassHandler(BaseHTTPRequestHandler):
             self.send_json({"error": str(e)}, 500)
 
 
+# ---------------------------------------------------------------------------
+# StdOut watchdog — Windlass watches StdOut (StdOut can't watch itself)
+# ---------------------------------------------------------------------------
+
+# Restart timestamps within the circuit-breaker window.
+_watchdog_restarts: list[float] = []
+_watchdog_lock = threading.Lock()
+
+
+def _stdout_is_healthy() -> bool:
+    """Return True if StdOut's health endpoint responds 2xx."""
+    try:
+        req = urllib.request.Request(f"{STDOUT_URL}/healthz", method="GET")
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
+
+
+def _restart_stdout() -> bool:
+    """Restart the StdOut container. Returns True on success."""
+    try:
+        result = subprocess.run(
+            ["docker", "restart", STDOUT_CONTAINER],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            log.error("[watchdog] docker restart %s failed: %s", STDOUT_CONTAINER, result.stderr.strip())
+            return False
+        log.warning("[watchdog] restarted StdOut container '%s'", STDOUT_CONTAINER)
+        return True
+    except Exception as e:
+        log.error("[watchdog] restart error: %s", e)
+        return False
+
+
+def _within_restart_budget() -> bool:
+    """Circuit breaker: True if we have not exceeded MAX_RESTARTS in the rolling window."""
+    now = time.time()
+    with _watchdog_lock:
+        # Drop timestamps outside the window
+        cutoff = now - WATCHDOG_RESTART_WINDOW_SEC
+        _watchdog_restarts[:] = [t for t in _watchdog_restarts if t >= cutoff]
+        return len(_watchdog_restarts) < WATCHDOG_MAX_RESTARTS
+
+
+def _record_restart() -> None:
+    with _watchdog_lock:
+        _watchdog_restarts.append(time.time())
+
+
+def stdout_watchdog_loop() -> None:
+    """
+    Poll StdOut health; after WATCHDOG_FAIL_THRESHOLD consecutive failures, restart its container.
+    A circuit breaker caps restarts per window; once exhausted, Windlass stops restarting and logs
+    an escalation (the crash-loop is a deeper problem a restart won't fix).
+    """
+    consecutive_fails = 0
+    breaker_tripped = False
+    log.info(
+        "[watchdog] StdOut watchdog active — url=%s container=%s interval=%ds threshold=%d",
+        STDOUT_URL, STDOUT_CONTAINER, WATCHDOG_INTERVAL_SEC, WATCHDOG_FAIL_THRESHOLD,
+    )
+    while True:
+        time.sleep(WATCHDOG_INTERVAL_SEC)
+        try:
+            if _stdout_is_healthy():
+                if consecutive_fails > 0:
+                    log.info("[watchdog] StdOut recovered (was failing %dx)", consecutive_fails)
+                consecutive_fails = 0
+                breaker_tripped = False
+                continue
+
+            consecutive_fails += 1
+            log.warning("[watchdog] StdOut health check failed (%d/%d)", consecutive_fails, WATCHDOG_FAIL_THRESHOLD)
+
+            if consecutive_fails < WATCHDOG_FAIL_THRESHOLD:
+                continue
+
+            if not _within_restart_budget():
+                if not breaker_tripped:
+                    breaker_tripped = True
+                    log.error(
+                        "[watchdog] CIRCUIT BREAKER: StdOut restarted %d+ times in %ds and is still "
+                        "unhealthy — NOT restarting again. This needs human/brain investigation.",
+                        WATCHDOG_MAX_RESTARTS, WATCHDOG_RESTART_WINDOW_SEC,
+                    )
+                continue
+
+            if _restart_stdout():
+                _record_restart()
+                consecutive_fails = 0  # give it time to come back before re-counting
+        except Exception as e:
+            log.error("[watchdog] loop error: %s", e)
+
+
 def run_server(port: int) -> None:
     schedule = load_schedule()
     log.info("Loaded %d services from schedule.yaml", len(schedule))
@@ -835,6 +944,13 @@ def run_server(port: int) -> None:
     t = threading.Thread(target=scheduler_loop, daemon=True)
     t.start()
     log.info("Scheduler thread started (interval: %ds)", SCHEDULE_INTERVAL_SEC)
+
+    # StdOut watchdog thread — Windlass watches StdOut because StdOut can't watch itself.
+    if WATCHDOG_ENABLED:
+        wd = threading.Thread(target=stdout_watchdog_loop, daemon=True)
+        wd.start()
+    else:
+        log.info("[watchdog] disabled (WINDLASS_WATCHDOG=false)")
 
     server = HTTPServer(("0.0.0.0", port), WindlassHandler)
     log.info("Windlass serving on port %d", port)
